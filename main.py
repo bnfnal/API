@@ -1,63 +1,125 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Query
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Depends
 from fastapi.responses import FileResponse
+from contextlib import asynccontextmanager
 from pathlib import Path
-from PIL import Image
 import shutil
 import cv2
 import uuid
-
-app = FastAPI()
+from datetime import datetime, timedelta
+import asyncio
+import magic
+import database
+from sqlalchemy.orm import Session
+from database import SessionLocal, MediaFile
 
 UPLOAD_DIR = Path("files")
 UPLOAD_DIR.mkdir(exist_ok=True)
 
+PREVIEW_DIR = Path("previews")
+PREVIEW_DIR.mkdir(exist_ok=True)
+PREVIEW_LIFETIME = timedelta(hours=1)
+
+async def clean_previews():
+    while True:
+        now = datetime.now()
+        for file in PREVIEW_DIR.iterdir():
+            if file.is_file():
+                file_mtime = datetime.fromtimestamp(file.stat().st_mtime)
+                if now - file_mtime > PREVIEW_LIFETIME:
+                    file.unlink()
+        await asyncio.sleep(3600)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    cleanup_task = asyncio.create_task(clean_previews())
+    try:
+        yield
+    finally:
+        cleanup_task.cancel()
+        try:
+            await cleanup_task
+        except asyncio.CancelledError:
+            pass
+
+app = FastAPI(lifespan=lifespan)
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
 @app.post("/upload/")
-def upload_file(file: UploadFile = File(...)):
-    if not is_image(file.filename) and not is_video(file.filename):
-        raise HTTPException(status_code=400, detail="Файл должен быть изображением или видео")
-
-    for existing_file in UPLOAD_DIR.glob(f"*_{file.filename}"):
-        existing_id = existing_file.stem.split("_")[0]
-        return {"id": existing_id, "filename": file.filename, "message": "Файл уже существует"}
-
-    unique_id = str(uuid.uuid4())
-    file_name = f"{unique_id}_{file.filename}"
+async def upload_file(file: UploadFile = File(...), db: Session = Depends(get_db)):
+    extension = Path(file.filename).suffix.lower()
+    file_id = str(uuid.uuid4())
+    file_name = f"{file_id}{extension}"
     file_path = UPLOAD_DIR / file_name
 
     with file_path.open("wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
 
-    return {"id": unique_id, "filename": file.filename, "message": "Файл успешно загружен"}
+    file_size = file_path.stat().st_size
+
+    if is_image(file_path):
+        file_type = "IMG"
+    elif is_video(file_path):
+        file_type = "VID"
+    else:
+        file_path.unlink()
+        raise HTTPException(status_code=400, detail="Файл должен быть изображением или видео")
+
+    new_file = MediaFile(
+        file_id=file_id,
+        path=str(file_path),
+        type=file_type,
+        size=file_size,
+        created_at=datetime.now()
+    )
+    db.add(new_file)
+    db.commit()
+    db.refresh(new_file)
+
+    return {"id": file_id, "message": "Файл успешно загружен"}
 
 
 @app.get("/download/{file_id}")
-def download_file(file_id: str, width: int = Query(None), height: int = Query(None)):
-    matching_files = list(UPLOAD_DIR.glob(f"{file_id}_*"))
-    if not matching_files:
+def download_file(file_id: str, width: int = Query(None), height: int = Query(None), db: Session = Depends(get_db)):
+    db_file = db.query(MediaFile).filter(MediaFile.file_id == file_id).first()
+
+    if not db_file:
         raise HTTPException(status_code=404, detail="Файл не найден")
-    file_path = matching_files[0]
+
+    file_path = Path(db_file.path)
 
     if width and height:
-        if is_image(file_path):
-            return create_image_preview(file_path, width, height)
-        elif is_video(file_path):
-            return create_video_preview(file_path, width, height)
+        preview_name = f"preview_{file_id}_{width}_{height}.jpg"
+        preview_path = PREVIEW_DIR / preview_name
+
+        if preview_path.exists():
+            return FileResponse(preview_path)
+
+        if db_file.type == "IMG":
+            return create_image_preview(file_path, preview_path, width, height)
+        elif db_file.type == "VID":
+            return create_video_preview(file_path, preview_path, width, height)
 
     return FileResponse(file_path, filename=file_path.name)
 
 
-def is_image(file_name: str) -> bool:
-    file_path = Path(file_name)
-    return file_path.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp"}
+def is_image(file_path: Path) -> bool:
+    mime = magic.Magic(mime=True)
+    mime_type = mime.from_file(str(file_path))
+    return mime_type.startswith("image/")
+
+def is_video(file_path: Path) -> bool:
+    mime = magic.Magic(mime=True)
+    mime_type = mime.from_file(str(file_path))
+    return mime_type.startswith("video/")
 
 
-def is_video(file_name: str) -> bool:
-    file_path = Path(file_name)
-    return file_path.suffix.lower() in {".mp4", ".avi", ".mov", ".mkv"}
-
-
-def create_image_preview(file_path: Path, width: int, height: int) -> FileResponse:
-    preview_path = file_path.with_name(f"preview_{file_path.stem}.jpg")
+def create_image_preview(file_path: Path, preview_path: Path, width: int, height: int) -> FileResponse:
     img = cv2.imread(str(file_path))
     if img is None:
         raise HTTPException(status_code=500, detail="Не удалось загрузить изображение для превью")
@@ -66,8 +128,7 @@ def create_image_preview(file_path: Path, width: int, height: int) -> FileRespon
     return FileResponse(preview_path)
 
 
-def create_video_preview(file_path: Path, width: int, height: int) -> FileResponse:
-    preview_path = file_path.with_name(f"preview_{file_path.stem}.jpg")
+def create_video_preview(file_path: Path, preview_path: Path, width: int, height: int) -> FileResponse:
     cap = cv2.VideoCapture(str(file_path))
     success, frame = cap.read()
     if not success:
