@@ -1,16 +1,16 @@
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Depends
 from fastapi.responses import FileResponse
-from contextlib import asynccontextmanager
+from sqlmodel import Session
+from models import MediaFile
+from database import get_session
 from pathlib import Path
 import shutil
-import cv2
 import uuid
 from datetime import datetime, timedelta
-import asyncio
 import magic
-import database
-from sqlalchemy.orm import Session
-from database import SessionLocal, MediaFile
+import cv2
+import asyncio
 
 UPLOAD_DIR = Path("files")
 UPLOAD_DIR.mkdir(exist_ok=True)
@@ -18,6 +18,8 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 PREVIEW_DIR = Path("previews")
 PREVIEW_DIR.mkdir(exist_ok=True)
 PREVIEW_LIFETIME = timedelta(hours=1)
+
+app = FastAPI()
 
 async def clean_previews():
     while True:
@@ -43,32 +45,29 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
 @app.post("/upload/")
-async def upload_file(file: UploadFile = File(...), db: Session = Depends(get_db)):
+async def upload_file(file: UploadFile = File(...), db: Session = Depends(get_session)):
     extension = Path(file.filename).suffix.lower()
     file_id = str(uuid.uuid4())
     file_name = f"{file_id}{extension}"
     file_path = UPLOAD_DIR / file_name
 
+    mime = magic.Magic(mime=True)
+    mime_type = mime.from_buffer(await file.read(2048))
+    await file.seek(0)
+
+    if mime_type.startswith("image/"):
+        file_type = "IMG"
+    elif mime_type.startswith("video/"):
+        file_type = "VID"
+    else:
+        raise HTTPException(status_code=400, detail="Файл должен быть изображением или видео")
+
+
     with file_path.open("wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
 
     file_size = file_path.stat().st_size
-
-    if is_image(file_path):
-        file_type = "IMG"
-    elif is_video(file_path):
-        file_type = "VID"
-    else:
-        file_path.unlink()
-        raise HTTPException(status_code=400, detail="Файл должен быть изображением или видео")
 
     new_file = MediaFile(
         file_id=file_id,
@@ -77,15 +76,20 @@ async def upload_file(file: UploadFile = File(...), db: Session = Depends(get_db
         size=file_size,
         created_at=datetime.now()
     )
-    db.add(new_file)
-    db.commit()
-    db.refresh(new_file)
+    try:
+        db.add(new_file)
+        db.commit()
+        db.refresh(new_file)
+    except Exception:
+        file_path.unlink()
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Ошибка сохранения файла в базу данных")
 
     return {"id": file_id, "message": "Файл успешно загружен"}
 
 
 @app.get("/download/{file_id}")
-def download_file(file_id: str, width: int = Query(None), height: int = Query(None), db: Session = Depends(get_db)):
+def download_file(file_id: str, width: int = Query(None), height: int = Query(None), db: Session = Depends(get_session)):
     db_file = db.query(MediaFile).filter(MediaFile.file_id == file_id).first()
 
     if not db_file:
@@ -106,17 +110,6 @@ def download_file(file_id: str, width: int = Query(None), height: int = Query(No
             return create_video_preview(file_path, preview_path, width, height)
 
     return FileResponse(file_path, filename=file_path.name)
-
-
-def is_image(file_path: Path) -> bool:
-    mime = magic.Magic(mime=True)
-    mime_type = mime.from_file(str(file_path))
-    return mime_type.startswith("image/")
-
-def is_video(file_path: Path) -> bool:
-    mime = magic.Magic(mime=True)
-    mime_type = mime.from_file(str(file_path))
-    return mime_type.startswith("video/")
 
 
 def create_image_preview(file_path: Path, preview_path: Path, width: int, height: int) -> FileResponse:
